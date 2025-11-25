@@ -130,7 +130,15 @@ def extract_image_urls_from_html(html: str, base_url: str) -> List[str]:
         match = re.search(r'url\(["\']?(.*?)["\']?\)', style)
         if match:
             add_url(match.group(1))
-
+    # 5) Myntra-specific fallback: scan for CDN URLs in raw HTML
+    lower_html = html.lower()
+    if "myntra" in base_url.lower() or "myntra" in lower_html:
+        cdn_pattern = re.compile(
+            r"https://assets\.myntassets\.com/[^\s\"')]+?\.(?:jpg|jpeg|png|webp|avif)",
+            re.IGNORECASE,
+        )
+        for match in cdn_pattern.findall(html):
+            add_url(match)
     return urls
 
 
