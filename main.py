@@ -13,8 +13,8 @@ GOOGLE_CSE_CX = "a2c879beabb934cb6"
 
 app = FastAPI(
     title="Ayna Brand Harvester",
-    description="Given a SKU URL, return one good product image URL for outreach.",
-    version="1.0.0",
+    description="Given a brand/company + optional URLs, return good product/hero images for outreach.",
+    version="3.0.0",
 )
 
 # ---------- MODELS ----------
@@ -47,13 +47,7 @@ class EnrichBrandResponse(BaseModel):
     notes: Optional[str] = None
 
 
-
 # ---------- HTML PARSING ----------
-
-import re
-from urllib.parse import urljoin
-from typing import List
-from bs4 import BeautifulSoup
 
 def extract_image_urls_from_html(html: str, base_url: str) -> List[str]:
     """
@@ -140,12 +134,198 @@ def extract_image_urls_from_html(html: str, base_url: str) -> List[str]:
     return urls
 
 
+# ---------- HELPERS ----------
+
+def find_candidate_product_or_catalog_url(html: str, base_url: str) -> Optional[str]:
+    """
+    Given a homepage or landing page HTML, try to find
+    one 'product-like' or 'catalog-like' URL.
+
+    Heuristics:
+    - Look at <a href="..."> links
+    - Prefer links containing 'product', 'products', 'shop', 'collection',
+      'catalog', 'buy', 'p/', 'dp/'
+    - Return the first match, resolved to absolute URL
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Keywords that suggest product or catalog pages
+    good_tokens = [
+        "/product", "/products", "/shop", "/collection", "/collections",
+        "/catalog", "/buy", "/p/", "/dp/", "/store"
+    ]
+
+    # Basic blacklist for homepage anchors / login / cart etc.
+    bad_tokens = [
+        "#", "login", "signin", "sign-in", "account",
+        "cart", "wishlist", "help", "faq", "contact", "about"
+    ]
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        href_lower = href.lower()
+
+        # Skip purely anchor or obviously non-product stuff
+        if any(bad in href_lower for bad in bad_tokens):
+            continue
+
+        # Build absolute URL
+        full_url = urljoin(base_url, href)
+
+        # Check if this looks like a product/catalog URL
+        if any(tok in full_url.lower() for tok in good_tokens):
+            return full_url
+
+    # If nothing matched, fallback: None (caller will handle)
+    return None
+
+
+def search_marketplace_product_url(company_name: str) -> Optional[str]:
+    """
+    Use Google Custom Search to find a marketplace product page for the brand.
+    Priority: Myntra -> Ajio -> NykaaFashion.
+    Returns the first product-ish URL, or None.
+    """
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
+        print("CSE config missing, skipping marketplace search.")
+        return None
+
+    base_url = "https://www.googleapis.com/customsearch/v1"
+
+    marketplace_sites = [
+        "myntra.com",
+        "ajio.com",
+        "nykaafashion.com",
+    ]
+
+    # Heuristic: product pages usually contain these tokens
+    product_tokens = ["/buy", "/p/", "/dp/", "/product", "/products"]
+
+    for site in marketplace_sites:
+        q = f'"{company_name}" site:{site}'
+
+        try:
+            resp = requests.get(
+                base_url,
+                params={
+                    "key": GOOGLE_CSE_API_KEY,
+                    "cx": GOOGLE_CSE_CX,
+                    "q": q,
+                    "num": 5,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            items = data.get("items", [])
+            for item in items:
+                link = item.get("link") or ""
+                lower = link.lower()
+                if any(tok in lower for tok in product_tokens):
+                    return link  # first product-ish URL
+
+            # If no “product-ish” URL, but we got results, fallback to first link:
+            if items:
+                return items[0].get("link")
+
+        except Exception as e:
+            print(f"CSE error for site {site}: {e}")
+
+    return None
+
+
+# --- NEW: fashion-biased website search ---
+
+FASHION_KEYWORDS = [
+    "clothing", "clothes", "apparel", "fashion", "wear", "streetwear",
+    "garments", "tshirts", "t-shirt", "denim", "jeans", "kurta", "saree",
+    "boutique", "label", "brand", "lookbook", "collection", "model", "studio"
+]
+
+BAD_WEBSITE_HOSTS = [
+    "myntra.com",
+    "ajio.com",
+    "nykaafashion.com",
+    "instagram.com",
+    "facebook.com",
+    "linkedin.com",
+    "x.com",
+    "twitter.com",
+    "pinterest.com",
+    "amazon.in",
+    "amazon.com",
+    "flipkart.com",
+]
+
+
+def _looks_like_fashion_site(item: dict) -> bool:
+    """Heuristic filter to keep only fashion/garment-ish sites."""
+    link = (item.get("link") or "").lower()
+    title = (item.get("title") or "").lower()
+    snippet = (item.get("snippet") or "").lower()
+
+    # Drop obvious marketplaces / socials
+    if any(bad in link for bad in BAD_WEBSITE_HOSTS):
+        return False
+
+    text = " ".join([title, snippet])
+    return any(kw in text for kw in FASHION_KEYWORDS)
+
+
+def search_brand_website_url(company_name: str) -> Optional[str]:
+    """
+    Use Google Custom Search to find the brand's main website,
+    biased towards fashion/garments/labels/model studios.
+    """
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
+        print("CSE config missing, skipping brand website search.")
+        return None
+
+    base_url = "https://www.googleapis.com/customsearch/v1"
+
+    # Bias query towards apparel/fashion context
+    q = f'"{company_name}" (clothing OR apparel OR fashion OR wear OR streetwear OR label)'
+
+    try:
+        resp = requests.get(
+            base_url,
+            params={
+                "key": GOOGLE_CSE_API_KEY,
+                "cx": GOOGLE_CSE_CX,
+                "q": q,
+                "num": 10,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+
+        if not items:
+            return None
+
+        # 1) Prefer items that *look* like fashion/garment sites
+        fashion_items = [it for it in items if _looks_like_fashion_site(it)]
+        if fashion_items:
+            return fashion_items[0].get("link")
+
+        # 2) Fallback: first non-bad host
+        for it in items:
+            link = (it.get("link") or "").lower()
+            if not any(bad in link for bad in BAD_WEBSITE_HOSTS):
+                return it.get("link")
+
+        # 3) Last resort: first result
+        return items[0].get("link")
+
+    except Exception as e:
+        print(f"CSE error while searching brand website for '{company_name}': {e}")
+        return None
+
 
 # ---------- MAIN ENDPOINT ----------
 
-@app.post("/enrich-brand", response_model=EnrichBrandResponse)
-@app.post("/enrich-brand", response_model=EnrichBrandResponse)
-@app.post("/enrich-brand", response_model=EnrichBrandResponse)
 @app.post("/enrich-brand", response_model=EnrichBrandResponse)
 def enrich_brand(payload: EnrichBrandRequest):
     """
@@ -234,6 +414,7 @@ def enrich_brand(payload: EnrichBrandRequest):
         image_urls: List[str] = []
         hero_url: Optional[str] = None
         try:
+            print(f"[website] Fetching {url}")
             resp = requests.get(
                 url,
                 headers={
@@ -241,12 +422,15 @@ def enrich_brand(payload: EnrichBrandRequest):
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0.0.0 Safari/537.36"
-                    )
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
                 },
                 timeout=10,
             )
+            print(f"[website] Status={resp.status_code}")
             resp.raise_for_status()
             image_urls = extract_image_urls_from_html(resp.text, url)
+            print(f"[website] Found {len(image_urls)} image candidates")
             if image_urls:
                 hero_url = image_urls[0]
         except Exception as e:
@@ -259,28 +443,36 @@ def enrich_brand(payload: EnrichBrandRequest):
         marketplace_image_urls: List[str] = []
         marketplace_hero_url: Optional[str] = None
 
-        if marketplace_product_url:
-            try:
-                m_resp = requests.get(
-                    marketplace_product_url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        )
-                    },
-                    timeout=10,
-                )
-                m_resp.raise_for_status()
+        if not marketplace_product_url:
+            print(f"[marketplace] No product URL found for {company_name}")
+            return None, None, []
 
-                marketplace_image_urls = extract_image_urls_from_html(
-                    m_resp.text, marketplace_product_url
-                )
-                if marketplace_image_urls:
-                    marketplace_hero_url = marketplace_image_urls[0]
-            except Exception as e:
-                print(f"Error fetching marketplace product page: {e}")
+        try:
+            print(f"[marketplace] Fetching {marketplace_product_url}")
+            m_resp = requests.get(
+                marketplace_product_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=10,
+            )
+            print(f"[marketplace] Status={m_resp.status_code}")
+            m_resp.raise_for_status()
+
+            marketplace_image_urls = extract_image_urls_from_html(
+                m_resp.text, marketplace_product_url
+            )
+            print(f"[marketplace] Found {len(marketplace_image_urls)} image candidates")
+
+            if marketplace_image_urls:
+                marketplace_hero_url = marketplace_image_urls[0]
+        except Exception as e:
+            print(f"[marketplace] Error fetching marketplace product page: {e}")
 
         return marketplace_product_url, marketplace_hero_url, marketplace_image_urls
 
@@ -421,177 +613,3 @@ def enrich_brand(payload: EnrichBrandRequest):
         website_candidate_image_urls=[dummy_image_url],
         notes="sku_url and website_url not provided; using dummy response for now.",
     )
-
-
-    # --- CASE 3: NEITHER SKU NOR WEBSITE (brand-name-only → future) ---
-    dummy_product_url = payload.website_url or "https://example.com/dummy-product"
-    dummy_image_url = "https://picsum.photos/800/1200"
-
-    return EnrichBrandResponse(
-        company_name=payload.company_name,
-        resolved_website_url=payload.website_url,
-        chosen_product_url=dummy_product_url,
-        chosen_image_url=dummy_image_url,
-        candidate_image_urls=[dummy_image_url],
-        website_product_url=dummy_product_url,
-        website_image_url=dummy_image_url,
-        website_candidate_image_urls=[dummy_image_url],
-        notes="sku_url and website_url not provided; using dummy response for now.",
-    )
-
-
-
-def find_candidate_product_or_catalog_url(html: str, base_url: str) -> Optional[str]:
-    """
-    Given a homepage or landing page HTML, try to find
-    one 'product-like' or 'catalog-like' URL.
-
-    Heuristics:
-    - Look at <a href="..."> links
-    - Prefer links containing 'product', 'products', 'shop', 'collection',
-      'catalog', 'buy', 'p/', 'dp/'
-    - Return the first match, resolved to absolute URL
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    # Keywords that suggest product or catalog pages
-    good_tokens = [
-        "/product", "/products", "/shop", "/collection", "/collections",
-        "/catalog", "/buy", "/p/", "/dp/", "/store"
-    ]
-
-    # Basic blacklist for homepage anchors / login / cart etc.
-    bad_tokens = [
-        "#", "login", "signin", "sign-in", "account",
-        "cart", "wishlist", "help", "faq", "contact", "about"
-    ]
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        href_lower = href.lower()
-
-        # Skip purely anchor or obviously non-product stuff
-        if any(bad in href_lower for bad in bad_tokens):
-            continue
-
-        # Build absolute URL
-        full_url = urljoin(base_url, href)
-
-        # Check if this looks like a product/catalog URL
-        if any(tok in full_url.lower() for tok in good_tokens):
-            return full_url
-
-    # If nothing matched, fallback: None (caller will handle)
-    return None
-
-
-def search_marketplace_product_url(company_name: str) -> Optional[str]:
-    """
-    Use Google Custom Search to find a marketplace product page for the brand.
-    Priority: Myntra -> Ajio -> NykaaFashion.
-    Returns the first product-ish URL, or None.
-    """
-    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
-        print("CSE config missing, skipping marketplace search.")
-        return None
-
-    base_url = "https://www.googleapis.com/customsearch/v1"
-
-    marketplace_sites = [
-        "myntra.com",
-        "ajio.com",
-        "nykaafashion.com",
-    ]
-
-    # Heuristic: product pages usually contain these tokens
-    product_tokens = ["/buy", "/p/", "/dp/", "/product", "/products"]
-
-    for site in marketplace_sites:
-        q = f'"{company_name}" site:{site}'
-
-        try:
-            resp = requests.get(
-                base_url,
-                params={
-                    "key": GOOGLE_CSE_API_KEY,
-                    "cx": GOOGLE_CSE_CX,
-                    "q": q,
-                    "num": 5,
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            items = data.get("items", [])
-            for item in items:
-                link = item.get("link") or ""
-                lower = link.lower()
-                if any(tok in lower for tok in product_tokens):
-                    return link  # first product-ish URL
-
-            # If no “product-ish” URL, but we got results, we could fallback to first link:
-            if items:
-                return items[0].get("link")
-
-        except Exception as e:
-            print(f"CSE error for site {site}: {e}")
-
-    return None
-
-def search_brand_website_url(company_name: str) -> Optional[str]:
-    """
-    Use Google Custom Search to find the brand's main website.
-    Returns the first non-marketplace, non-social domain result.
-    """
-    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
-        print("CSE config missing, skipping brand website search.")
-        return None
-
-    base_url = "https://www.googleapis.com/customsearch/v1"
-
-    try:
-        resp = requests.get(
-            base_url,
-            params={
-                "key": GOOGLE_CSE_API_KEY,
-                "cx": GOOGLE_CSE_CX,
-                "q": company_name,
-                "num": 5,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-
-        if not items:
-            return None
-
-        # Domains we want to avoid as "website"
-        bad_hosts = [
-            "myntra.com",
-            "ajio.com",
-            "nykaafashion.com",
-            "instagram.com",
-            "facebook.com",
-            "linkedin.com",
-            "x.com",
-            "twitter.com",
-            "pinterest.com",
-            "amazon.in",
-            "amazon.com",
-        ]
-
-        for item in items:
-            link = item.get("link") or ""
-            lower = link.lower()
-            if not any(bad in lower for bad in bad_hosts):
-                return link
-
-        # Fallback to first result if none filtered
-        return items[0].get("link")
-
-    except Exception as e:
-        print(f"CSE error while searching brand website: {e}")
-        return None
